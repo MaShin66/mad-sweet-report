@@ -68,8 +68,96 @@ check('재고 알림이 살아 있으면 가격 알림은 접힘',
   decideEvents({ notifyOn: ['restock', 'price_drop'], maxPrice: 9000 },
     { status: 'out', price: 11000 }, { status: 'in', price: 8500 }).length === 1);
 
+/* ---- 디스코드 임베드 ---- */
+async function discordTests() {
+  const realFetch = global.fetch;
+  const capture = (responses) => {
+    const sent = [];
+    let n = 0;
+    global.fetch = async (url, init) => {
+      sent.push({ url, body: JSON.parse(init.body) });
+      const r = responses[Math.min(n++, responses.length - 1)];
+      return { ok: r.status < 300, status: r.status, text: async () => r.text || '{}' };
+    };
+    return sent;
+  };
+
+  try {
+    // 재입고 알림 한 통
+    let sent = capture([{ status: 204 }]);
+    await CHANNELS.discord(
+      { webhookUrl: 'https://discord.test/hook' },
+      { event: 'restock', label: '재입고', name: '서울우유 생크림', price: 8900, url: 'https://link.test/a', text: '[재입고] 서울우유 생크림 8,900원' },
+    );
+    const body = sent[0].body;
+    const embed = body.embeds[0];
+    check('디스코드: 임베드 1개', body.embeds.length === 1);
+    check('디스코드: 상품명이 제목', embed.title === '서울우유 생크림');
+    check('디스코드: 제목에 링크', embed.url === 'https://link.test/a');
+    check('디스코드: 재입고는 초록', embed.color === 0x2ecc71, String(embed.color));
+    check('디스코드: 가격 필드', embed.fields.some((f) => f.value === '8,900원'));
+    check('디스코드: 타임스탬프 ISO', !Number.isNaN(Date.parse(embed.timestamp)));
+    check('디스코드: 멘션 없으면 전부 차단', JSON.stringify(body.allowed_mentions) === '{"parse":[]}');
+    check('디스코드: content 비어 있음', body.content === undefined);
+
+    // 이벤트별 색이 갈리는지
+    sent = capture([{ status: 204 }]);
+    await CHANNELS.discord({ webhookUrl: 'https://discord.test/hook' },
+      { event: 'soldout', label: '품절 전환', name: 'x', price: null, url: 'https://t', text: 't' });
+    check('디스코드: 품절은 회색', sent[0].body.embeds[0].color === 0x95a5a6);
+    check('디스코드: 가격 없으면 필드 생략', !sent[0].body.embeds[0].fields.some((f) => f.name === '가격'));
+
+    // 멘션을 켜면 content 에 실리고 멘션이 허용돼야 한다
+    sent = capture([{ status: 204 }]);
+    await CHANNELS.discord({ webhookUrl: 'https://discord.test/hook', mention: '@here', username: '생크림봇' },
+      { event: 'restock', label: '재입고', name: 'x', price: 1000, url: 'https://t', text: 't' });
+    check('디스코드: 멘션이 content 로', sent[0].body.content === '@here');
+    check('디스코드: 멘션 허용됨', sent[0].body.allowed_mentions.parse.includes('everyone'));
+    check('디스코드: username 반영', sent[0].body.username === '생크림봇');
+
+    // 살 수 없는 알림(품절 전환)에는 멘션이 붙으면 안 된다
+    sent = capture([{ status: 204 }]);
+    await CHANNELS.discord({ webhookUrl: 'https://discord.test/hook', mention: '@here' },
+      { event: 'soldout', label: '품절 전환', name: 'x', price: null, url: 'https://t', text: 't' });
+    check('디스코드: 품절 전환엔 멘션 안 붙음', sent[0].body.content === undefined);
+    check('디스코드: 멘션 없을 때 파싱 차단', JSON.stringify(sent[0].body.allowed_mentions) === '{\"parse\":[]}');
+
+    // mentionOn 을 직접 지정하면 그대로 따른다
+    sent = capture([{ status: 204 }]);
+    await CHANNELS.discord({ webhookUrl: 'https://discord.test/hook', mention: '@here', mentionOn: ['soldout'] },
+      { event: 'soldout', label: '품절 전환', name: 'x', price: null, url: 'https://t', text: 't' });
+    check('디스코드: mentionOn 직접 지정', sent[0].body.content === '@here');
+
+    // 레이트리밋(429) 을 만나면 retry_after 만큼 쉬고 한 번 재시도
+    sent = capture([{ status: 429, text: '{"retry_after":0.05}' }, { status: 204 }]);
+    await CHANNELS.discord({ webhookUrl: 'https://discord.test/hook' },
+      { event: 'restock', label: '재입고', name: 'x', price: null, url: 'https://t', text: 't' });
+    check('디스코드: 429 후 재시도', sent.length === 2, `${sent.length}회 전송`);
+
+    // 두 번째도 실패하면 조용히 넘어가지 말고 던져야 한다
+    sent = capture([{ status: 500, text: 'boom' }]);
+    let threw = false;
+    try {
+      await CHANNELS.discord({ webhookUrl: 'https://discord.test/hook' },
+        { event: 'restock', label: '재입고', name: 'x', price: null, url: 'https://t', text: 't' });
+    } catch { threw = true; }
+    check('디스코드: 실패는 예외로', threw);
+
+    // 웹훅 URL 이 없으면 바로 알려줘야 한다
+    threw = false;
+    try {
+      await CHANNELS.discord({ webhookUrl: '' }, { event: 'restock', name: 'x', url: 'https://t', text: 't' });
+    } catch { threw = true; }
+    check('디스코드: URL 없으면 예외', threw);
+  } finally {
+    global.fetch = realFetch;
+  }
+}
+
 /* ---- 카카오 토큰 만료 -> 자동 갱신 ---- */
 (async () => {
+  await discordTests();
+
   const seen = [];
   const realFetch = global.fetch;
   global.fetch = async (url, init) => {

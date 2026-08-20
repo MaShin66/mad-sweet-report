@@ -279,6 +279,32 @@ async function refreshKakaoToken(conf) {
   return kakaoTokenCache;
 }
 
+/* 디스코드 임베드. 색으로 무슨 일인지 한눈에 보이게 한다. */
+const DISCORD_COLORS = {
+  restock:    0x2ecc71, // 초록 - 지금 사야 하는 상황
+  available:  0x2ecc71,
+  price_drop: 0x3498db, // 파랑 - 값이 내려감
+  soldout:    0x95a5a6, // 회색 - 빠졌음
+  gone:       0xe74c3c, // 빨강 - 페이지가 없어짐
+  test:       0x9b59b6,
+};
+
+function buildDiscordEmbed(msg) {
+  const embed = {
+    title: msg.name,
+    url: msg.url,
+    description: msg.label ? `**${msg.label}**` : msg.text,
+    color: DISCORD_COLORS[msg.event] ?? 0x95a5a6,
+    timestamp: new Date().toISOString(),
+    fields: [],
+  };
+  if (msg.price != null) {
+    embed.fields.push({ name: '가격', value: `${msg.price.toLocaleString('ko-KR')}원`, inline: true });
+  }
+  embed.fields.push({ name: '바로가기', value: `[쿠팡에서 열기](${msg.url})`, inline: true });
+  return embed;
+}
+
 const CHANNELS = {
   /* 카카오톡 "나에게 보내기". talk_message 스코프가 필요하다. 본문 200자 제한. */
   async kakao(conf, msg) {
@@ -315,7 +341,32 @@ const CHANNELS = {
   async discord(conf, msg) {
     const hook = secret(conf.webhookUrl);
     if (!hook) throw new Error('discord webhookUrl 이 비어 있음');
-    const r = await postJson(hook, { content: `${msg.text}\n${msg.url}` });
+
+    const payload = {
+      username: conf.username || '재입고 감시기',
+      embeds: [buildDiscordEmbed(msg)],
+      // 상품명에 @everyone 같은 문자열이 섞여 들어와도 멘션으로 터지지 않게 막는다.
+      // mention 을 설정한 경우에만 실제 멘션을 허용한다.
+      allowed_mentions: { parse: [] },
+    };
+    /* 재입고는 놓치면 끝이라 알림음이 울리게 멘션을 붙일 수 있다. 예: "@here", "<@사용자ID>"
+       단 지금 당장 살 수 있는 알림에만 붙인다. 품절 전환까지 @here 가 울리면
+       며칠 만에 알림을 꺼버리게 된다. */
+    const MENTION_DEFAULT = ['restock', 'available', 'price_drop', 'test'];
+    const mentionOn = conf.mentionOn || MENTION_DEFAULT;
+    if (conf.mention && mentionOn.includes(msg.event)) {
+      payload.content = conf.mention;
+      payload.allowed_mentions = { parse: ['everyone', 'users', 'roles'] };
+    }
+
+    let r = await postJson(hook, payload);
+    if (r.status === 429) {
+      // 디스코드 웹훅 레이트리밋. 얼마나 기다리라고 알려주니 그만큼 쉬고 한 번만 재시도.
+      let waitMs = 1000;
+      try { waitMs = Math.ceil((JSON.parse(r.text).retry_after || 1) * 1000); } catch { /* 기본값 */ }
+      await sleep(Math.min(waitMs, 10000));
+      r = await postJson(hook, payload);
+    }
     if (!r.ok) throw new Error(`discord ${r.status} ${r.text.slice(0, 200)}`);
   },
 
@@ -505,6 +556,7 @@ async function runOnce(cfg, statePath) {
       }
       await notify(cfg, {
         event: ev.kind,
+        label: ev.label,
         name: target.name,
         price: now.price,
         url: target.shortUrl || now.url,
@@ -589,6 +641,7 @@ async function cmdNotifyTest(cfg) {
   const t = cfg.targets[0];
   await notify(cfg, {
     event: 'test',
+    label: '테스트',
     name: t.name,
     price: t.maxPrice ?? null,
     url: t.shortUrl || t.url,

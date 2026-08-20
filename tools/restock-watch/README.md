@@ -141,6 +141,46 @@ node watch.js watch
 만료를 감지해서 알아서 새로 받는다. 리프레시 토큰이 갱신되면 콘솔에 새 값을
 찍어주니 환경변수를 바꿔두면 된다. (리프레시 토큰 자체는 두 달간 유효)
 
+## 디스코드 알림 설정
+
+가장 손이 덜 간다. 토큰 발급 절차 없이 웹훅 URL 하나면 끝난다.
+
+1. 디스코드에서 알림 받을 채널 → **채널 편집 → 연동 → 웹후크 → 새 웹후크**
+2. **웹후크 URL 복사**
+3. 환경변수로 넣는다 (설정 파일에 직접 쓰지 말 것)
+
+   ```bash
+   export DISCORD_WEBHOOK_URL='https://discord.com/api/webhooks/...'
+   ```
+
+4. `targets.json` 의 `notify.discord.enabled` 를 `true` 로
+
+   ```jsonc
+   "discord": {
+     "enabled": true,
+     "webhookUrl": "env:DISCORD_WEBHOOK_URL",
+     "username": "재입고 감시기",
+     "mention": "@here",                                      // 생략하면 멘션 없음
+     "mentionOn": ["restock", "available", "price_drop", "test"]
+   }
+   ```
+
+5. `node watch.js notify-test` 로 확인
+
+알림은 임베드로 나가고 이벤트별로 색이 다르다.
+재입고·구매가능은 초록, 가격 하락은 파랑, 품절 전환은 회색, 페이지 삭제는 빨강.
+제목을 누르면 바로 상품 페이지로 간다.
+
+**멘션은 지금 살 수 있는 알림에만 붙는다.** 품절 전환까지 `@here` 가 울리면
+며칠 만에 채널 알림을 꺼버리게 되기 때문이다. 바꾸려면 `mentionOn` 에 직접 적으면 된다.
+
+상품명에 `@everyone` 같은 문자열이 섞여 들어와도 멘션으로 터지지 않게
+`allowed_mentions` 로 막아둔다. 웹훅이 레이트리밋(429)에 걸리면 서버가 알려준
+시간만큼 쉬었다가 한 번 재시도한다.
+
+> 웹훅 URL은 비밀번호와 같다. 이 URL을 아는 사람은 누구나 해당 채널에 글을 쓸 수 있다.
+> 공개된 곳에 노출됐다면 디스코드에서 웹후크를 삭제하고 새로 만들면 된다.
+
 ## 백그라운드로 돌리기
 
 ### cron (리눅스 / 맥) — 5분마다 1회 검사

@@ -7,7 +7,13 @@
   "notify": {
     "kakao":   { "enabled": false, "accessToken": "env:KAKAO_ACCESS_TOKEN" },
     "slack":   { "enabled": false, "webhookUrl": "env:SLACK_WEBHOOK_URL" },
-    "discord": { "enabled": false, "webhookUrl": "env:DISCORD_WEBHOOK_URL" },
+    "discord": {
+      "enabled": false,
+      "webhookUrl": "env:DISCORD_WEBHOOK_URL",
+      "username": "재입고 감시기",
+      "mention": "@here",
+      "mentionOn": ["restock", "available", "price_drop", "test"]
+    },
     "webhook": { "enabled": false, "url": "env:RESTOCK_WEBHOOK_URL", "headers": {} },
     "exec":    { "enabled": false, "command": "osascript -e 'display notification \"'\"$RESTOCK_TEXT\"'\"'" }
   },

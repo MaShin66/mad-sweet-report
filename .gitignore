@@ -1,3 +1,10 @@
 *.png
 *.mjs
 .DS_Store
+
+# 재입고 감시기: 실제 설정(토큰 포함)과 실행 상태는 커밋하지 않는다
+tools/restock-watch/targets.json
+tools/restock-watch/state.json
+tools/restock-watch/state.json.tmp
+tools/restock-watch/dump.html
+tools/restock-watch/*.log

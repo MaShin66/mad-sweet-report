@@ -1,0 +1,26 @@
+{
+  "intervalSeconds": 300,
+  "jitterSeconds": 60,
+  "timeoutMs": 15000,
+  "retries": 2,
+
+  "notify": {
+    "kakao":   { "enabled": false, "accessToken": "env:KAKAO_ACCESS_TOKEN" },
+    "slack":   { "enabled": false, "webhookUrl": "env:SLACK_WEBHOOK_URL" },
+    "discord": { "enabled": false, "webhookUrl": "env:DISCORD_WEBHOOK_URL" },
+    "webhook": { "enabled": false, "url": "env:RESTOCK_WEBHOOK_URL", "headers": {} },
+    "exec":    { "enabled": false, "command": "osascript -e 'display notification \"'\"$RESTOCK_TEXT\"'\"'" }
+  },
+
+  "targets": [
+    {
+      "id": "seoulmilk-cream",
+      "name": "서울우유 생크림",
+      "url": "https://www.coupang.com/vp/products/PRODUCT_ID?itemId=ITEM_ID&vendorItemId=VENDOR_ITEM_ID",
+      "shortUrl": "https://link.coupang.com/a/gm5wpJlfCS",
+      "maxPrice": null,
+      "notifyOn": ["restock", "available"],
+      "cooldownMinutes": 120
+    }
+  ]
+}

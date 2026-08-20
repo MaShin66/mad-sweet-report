@@ -15,22 +15,78 @@ function check(name, ok, detail) {
   console.log(`${ok ? 'PASS' : 'FAIL'}  ${name}${ok || !detail ? '' : `  (${detail})`}`);
 }
 
+/* ---- 실제로 겪은 버그: 본품은 판매중인데 알림이 안 왔다 ----
+   쿠팡 상품 페이지에는 "함께 본 상품" 이 같이 실린다. 거기 품절된 게 섞여
+   있으면 페이지 전체를 훑던 예전 로직이 품절 신호를 잡아 판정불가로 떨어졌다. */
+const 관련상품에_품절_섞인_판매중_페이지 = `
+<html><head>
+<meta property="og:title" content="서울우유 생크림 500ml">
+<script type="application/ld+json">
+{"@type":"Product","name":"서울우유 생크림 500ml",
+ "offers":{"@type":"Offer","price":"8900","availability":"http://schema.org/InStock"}}
+</script>
+</head><body>
+  <div class="prod-atf">
+    <h1 class="prod-buy-header__title">서울우유 생크림 500ml</h1>
+    <span class="total-price"><strong>8,900 원</strong></span>
+    <button class="prod-cart-btn">장바구니 담기</button>
+  </div>
+  <section class="related-products">
+    <h3>함께 본 상품</h3>
+    <div class="oos-label">일시품절</div>
+    <span>매일유업 휘핑크림 1L</span>
+    <button>재입고 알림 신청</button>
+  </section>
+  <section class="prod-review"><h3>상품평 (1,204)</h3></section>
+</body></html>`;
+
+{
+  const v = judgeStock(관련상품에_품절_섞인_판매중_페이지);
+  check('관련 상품에 품절이 섞여도 본품은 판매중', v.status === 'in', `실제=${v.status} 근거=${v.reason}`);
+  check('그 판정은 JSON-LD 로 내려야 한다', v.tier === 'jsonld', `tier=${v.tier}`);
+}
+
+// JSON-LD 가 없는 판매중 페이지도 관련 상품에 오염되면 안 된다
+{
+  const noLd = 관련상품에_품절_섞인_판매중_페이지.replace(/<script type="application\/ld\+json">[\s\S]*?<\/script>/, '');
+  const v = judgeStock(noLd);
+  check('JSON-LD 없어도 구매 영역만 보고 판매중', v.status === 'in', `실제=${v.status} 근거=${v.reason}`);
+  check('그때는 구매 영역으로 범위를 좁힌다', v.scope === 'buybox', `scope=${v.scope}`);
+}
+
+// 본품이 진짜 품절이면 당연히 품절로 읽혀야 한다
+{
+  const realOos = 관련상품에_품절_섞인_판매중_페이지.replace('schema.org/InStock', 'schema.org/OutOfStock');
+  check('본품이 품절이면 품절', judgeStock(realOos).status === 'out');
+}
+
+// JSON-LD 가 본품보다 관련 상품을 먼저 싣는 일은 없다는 가정을 명시해 둔다
+{
+  const twoProducts = `
+    <script type="application/ld+json">
+    [{"@type":"Product","offers":{"availability":"http://schema.org/InStock"}},
+     {"@type":"Product","offers":{"availability":"http://schema.org/OutOfStock"}}]
+    </script>`;
+  check('JSON-LD 가 여러 개면 문서상 첫 번째가 본품', judgeStock(twoProducts).status === 'in');
+}
+
 /* ---- 재고 판정 ---- */
 const STOCK_CASES = [
-  ['판매중: JSON-LD', '{"availability":"http://schema.org/InStock"}', 'in'],
+  ['판매중: JSON-LD', '<script type="application/ld+json">{"@type":"Product","offers":{"availability":"http://schema.org/InStock"}}</script>', 'in'],
   ['판매중: 장바구니 버튼', '<button class="prod-cart-btn">장바구니 담기</button>', 'in'],
   ['판매중: og 메타', '<meta property="product:availability" content="instock">', 'in'],
-  ['품절: JSON-LD', '{"availability":"http://schema.org/OutOfStock"}', 'out'],
+  ['품절: JSON-LD', '<script type="application/ld+json">{"@type":"Product","offers":{"availability":"http://schema.org/OutOfStock"}}</script>', 'out'],
   ['품절: 일시품절 라벨', '<div class="oos-label">일시품절</div>', 'out'],
   ['품절: 재입고 알림 버튼', '<button>재입고 알림 신청</button>', 'out'],
   ['품절: 판매 종료', '<p>현재 판매하지 않는 상품입니다</p>', 'out'],
   ['판정불가: 빈 문서', '<html></html>', 'unknown'],
   ['판정불가: 봇 확인 페이지', '<html><body>Access Denied</body></html>', 'unknown'],
-  ['판정불가: 신호 충돌', '<meta property="product:availability" content="instock"><div class="oos-label">일시품절</div>', 'unknown'],
+  ['판정불가: 텍스트 신호끼리 충돌', '<button>재입고 알림 신청</button><button>장바구니 담기</button>', 'unknown'],
   // JSON-LD(가중치 100)는 버튼 텍스트(70)보다 세다. 품절인데 버튼이 남아 있는
   // 페이지에서 가짜 재입고가 나가면 안 된다.
+  // JSON-LD 가 있으면 버튼 텍스트는 보지 않는다
   ['품절 우선: LD 품절 + 장바구니 버튼',
-    '{"availability":"http://schema.org/OutOfStock"}<button>장바구니 담기</button>', 'out'],
+    '<script type="application/ld+json">{"@type":"Product","offers":{"availability":"http://schema.org/OutOfStock"}}</script><button>장바구니 담기</button>', 'out'],
 ];
 for (const [name, html, expect] of STOCK_CASES) {
   const got = judgeStock(html).status;

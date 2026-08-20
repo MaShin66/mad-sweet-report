@@ -22,6 +22,16 @@ const path = require('node:path');
 const { spawn } = require('node:child_process');
 
 const HERE = __dirname;
+
+/* 화면과 로그 파일에 같이 남긴다. 상주로 돌려놓고 나중에 "왜 알림이 안 왔지"
+   를 따지려면 기록이 있어야 한다. setLogFile 로 경로를 준 뒤부터 파일에도 쓴다. */
+let LOG_FILE = null;
+function setLogFile(file) { LOG_FILE = file || null; }
+function log(line) {
+  console.log(line);
+  if (!LOG_FILE) return;
+  try { fs.appendFileSync(LOG_FILE, `${line}\n`); } catch { /* 로그 실패로 감시를 멈추지 않는다 */ }
+}
 const DEFAULT_CONFIG = path.join(HERE, 'targets.json');
 const DEFAULT_STATE = path.join(HERE, 'state.json');
 
@@ -39,26 +49,132 @@ const DEFAULT_UA =
 /* ------------------------------------------------------------------ *
  * 재고 판정
  *
- * 쿠팡 마크업은 예고 없이 바뀐다. 그래서 셀렉터 하나에 걸지 않고
- * 여러 신호를 모아 가장 신뢰도 높은 쪽을 택한다. 신호가 서로 부딪히거나
- * 하나도 안 잡히면 unknown 으로 두고 알림을 보내지 않는다.
- * 잘못된 "재입고!" 알림이 놓친 알림보다 더 나쁘기 때문이다.
+ * 페이지 전체를 훑으면 안 된다. 쿠팡 상품 페이지에는 "함께 본 상품",
+ * "다른 옵션", 리뷰가 같이 실리고 그중 품절된 게 하나라도 있으면
+ * "일시품절" 이 잡힌다. 본품이 멀쩡히 팔리는데 품절로 읽히는 것이다.
+ *
+ * 그래서 세 단계로 나눈다.
+ *   1) JSON-LD  - 본품을 특정해서 서술한다. 있으면 이것만 믿는다
+ *   2) og 메타   - 그다음으로 믿을 만하다
+ *   3) 텍스트 추론 - 위 둘이 없을 때만. 그것도 구매 영역으로 범위를 좁혀서
  * ------------------------------------------------------------------ */
-const SIGNALS = [
-  // -- 품절 --
-  { id: 'ld-oos',      verdict: 'out', weight: 100, re: /"availability"\s*:\s*"[^"]*OutOfStock"/i },
-  { id: 'meta-oos',    verdict: 'out', weight: 95,  re: /product:availability"[^>]*content="\s*(?:oos|out\s*of\s*stock)/i },
-  { id: 'oos-label',   verdict: 'out', weight: 90,  re: /class="[^"]*oos-label/i },
-  { id: 'oos-text',    verdict: 'out', weight: 85,  re: /일시\s*품절/ },
-  { id: 'not-sale',    verdict: 'out', weight: 85,  re: /현재\s*판매하지\s*않는\s*상품/ },
-  { id: 'sold-out',    verdict: 'out', weight: 75,  re: /품절된\s*상품|판매\s*종료/ },
-  { id: 'restock-btn', verdict: 'out', weight: 70,  re: /재입고\s*알림\s*(?:신청|받기)/ },
-  // -- 구매 가능 --
-  { id: 'ld-in',       verdict: 'in',  weight: 100, re: /"availability"\s*:\s*"[^"]*InStock"/i },
-  { id: 'meta-in',     verdict: 'in',  weight: 95,  re: /product:availability"[^>]*content="\s*instock/i },
-  { id: 'cart-btn',    verdict: 'in',  weight: 70,  re: /장바구니\s*담기/ },
-  { id: 'buy-btn',     verdict: 'in',  weight: 65,  re: /바로\s*구매|구매하기<|지금\s*구매/ },
+
+/* 3단계에서만 쓰는 신호. 1·2단계가 잡히면 여기까지 오지 않는다. */
+const HEURISTIC_SIGNALS = [
+  { id: 'oos-label',   verdict: 'out', weight: 90, re: /class="[^"]*oos-label/i },
+  { id: 'oos-text',    verdict: 'out', weight: 85, re: /일시\s*품절/ },
+  { id: 'not-sale',    verdict: 'out', weight: 85, re: /현재\s*판매하지\s*않는\s*상품/ },
+  { id: 'sold-out',    verdict: 'out', weight: 75, re: /품절된\s*상품|판매\s*종료/ },
+  { id: 'restock-btn', verdict: 'out', weight: 70, re: /재입고\s*알림\s*(?:신청|받기)/ },
+  { id: 'cart-btn',    verdict: 'in',  weight: 70, re: /장바구니\s*담기/ },
+  { id: 'buy-btn',     verdict: 'in',  weight: 65, re: /바로\s*구매|구매하기<|지금\s*구매/ },
 ];
+
+/** 페이지에 박힌 JSON-LD 블록을 전부 뽑는다. 깨진 블록은 건너뛴다. */
+function extractJsonLd(html) {
+  const blocks = [];
+  const re = /<script[^>]+type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi;
+  let m;
+  while ((m = re.exec(html)) !== null) {
+    try { blocks.push(JSON.parse(m[1].trim())); } catch { /* 쿠팡 JSON-LD 는 가끔 깨져 있다 */ }
+  }
+  return blocks;
+}
+
+/** JSON-LD 안의 Product 노드들에서 availability 를 문서 순서대로 모은다. */
+function collectAvailability(nodes) {
+  const found = [];
+  const walk = (n, depth) => {
+    if (!n || typeof n !== 'object' || depth > 8) return;
+    if (Array.isArray(n)) { n.forEach((x) => walk(x, depth + 1)); return; }
+    const type = n['@type'];
+    const isProduct = type === 'Product' || (Array.isArray(type) && type.includes('Product'));
+    if (isProduct && n.offers) {
+      for (const o of [].concat(n.offers)) {
+        if (o && o.availability) found.push(String(o.availability));
+      }
+    }
+    for (const k of Object.keys(n)) walk(n[k], depth + 1);
+  };
+  nodes.forEach((n) => walk(n, 0));
+  return found;
+}
+
+/* 구매 영역만 잘라낸다. 여기서부터 아래로 관련 상품·리뷰가 붙는데
+   그쪽 품절 표시가 본품 판정을 오염시킨다. */
+const BUYBOX_START = /class="[^"]*(?:prod-atf|prod-buy|prod-order|prod-price|prod-sale)/i;
+const BUYBOX_END = /(?:함께\s*본\s*상품|함께\s*구매|다른\s*고객|상품평|리뷰\s*\(|class="[^"]*(?:prod-review|review-content|related-|recommend))/i;
+
+function extractBuyBox(html) {
+  const start = html.search(BUYBOX_START);
+  if (start < 0) return null;
+  const rest = html.slice(start);
+  const endRel = rest.search(BUYBOX_END);
+  const box = endRel > 0 ? rest.slice(0, endRel) : rest.slice(0, 200000);
+  return box;
+}
+
+/**
+ * HTML을 보고 재고 상태를 판정한다.
+ * @returns {{status:'in'|'out'|'unknown', matched:string[], reason:string,
+ *            tier:'jsonld'|'meta'|'heuristic'|'none', scope:'document'|'buybox'}}
+ */
+function judgeStock(html) {
+  // -- 1단계: JSON-LD. 본품을 특정해서 서술하므로 가장 믿을 만하다 --
+  const availability = collectAvailability(extractJsonLd(html));
+  if (availability.length > 0) {
+    // 관련 상품까지 JSON-LD 에 들어 있는 경우가 있다. 문서에 먼저 나오는 것이 본품이다.
+    const primary = availability[0];
+    const extra = availability.length > 1 ? ` (Product ${availability.length}개 중 첫 번째)` : '';
+    if (/InStock/i.test(primary)) {
+      return { status: 'in', matched: ['jsonld:InStock'], reason: `JSON-LD availability${extra}`, tier: 'jsonld', scope: 'document' };
+    }
+    if (/OutOfStock|SoldOut|Discontinued/i.test(primary)) {
+      return { status: 'out', matched: ['jsonld:OutOfStock'], reason: `JSON-LD availability${extra}`, tier: 'jsonld', scope: 'document' };
+    }
+  }
+
+  // -- 2단계: og 메타 --
+  const metaIn = /product:availability"[^>]*content="\s*instock/i.test(html);
+  const metaOut = /product:availability"[^>]*content="\s*(?:oos|out\s*of\s*stock)/i.test(html);
+  if (metaIn !== metaOut) {
+    return metaIn
+      ? { status: 'in', matched: ['meta:instock'], reason: 'og 메타', tier: 'meta', scope: 'document' }
+      : { status: 'out', matched: ['meta:oos'], reason: 'og 메타', tier: 'meta', scope: 'document' };
+  }
+
+  // -- 3단계: 텍스트 추론 --
+  const scan = (hay) => {
+    const matched = [];
+    let bestIn = 0;
+    let bestOut = 0;
+    for (const sig of HEURISTIC_SIGNALS) {
+      if (!sig.re.test(hay)) continue;
+      matched.push(sig.id);
+      if (sig.verdict === 'in') bestIn = Math.max(bestIn, sig.weight);
+      else bestOut = Math.max(bestOut, sig.weight);
+    }
+    return { matched, bestIn, bestOut };
+  };
+
+  // 구매 영역으로 좁혔을 때 거기서 뭔가 잡히면 그걸 쓴다. 좁혔더니 아무것도
+  // 없다면 잘라낸 위치가 틀린 것이므로 문서 전체로 돌아간다.
+  const buyBox = extractBuyBox(html);
+  const narrowed = buyBox ? scan(buyBox) : null;
+  const useNarrow = narrowed !== null && narrowed.matched.length > 0;
+  const scope = useNarrow ? 'buybox' : 'document';
+  const { matched, bestIn, bestOut } = useNarrow ? narrowed : scan(html);
+
+  if (bestIn === 0 && bestOut === 0) {
+    return { status: 'unknown', matched, reason: '재고 신호를 하나도 못 찾음 (마크업이 바뀌었거나 차단 페이지)', tier: 'none', scope };
+  }
+  if (Math.abs(bestIn - bestOut) < AMBIGUITY_MARGIN) {
+    return { status: 'unknown', matched, reason: `판매중(${bestIn})/품절(${bestOut}) 신호가 맞붙음`, tier: 'heuristic', scope };
+  }
+  return bestIn > bestOut
+    ? { status: 'in', matched, reason: '판매중 신호 우세', tier: 'heuristic', scope }
+    : { status: 'out', matched, reason: '품절 신호 우세', tier: 'heuristic', scope };
+}
 
 const PRICE_PATTERNS = [
   /"salePrice"\s*:\s*"?([\d,]+)/,
@@ -79,36 +195,6 @@ function firstMatch(html, patterns) {
     if (m && m[1]) return m[1].trim();
   }
   return null;
-}
-
-/**
- * HTML을 보고 재고 상태를 판정한다.
- * @returns {{status:'in'|'out'|'unknown', matched:string[], reason:string}}
- */
-function judgeStock(html) {
-  const matched = [];
-  let bestIn = 0;
-  let bestOut = 0;
-
-  for (const sig of SIGNALS) {
-    if (!sig.re.test(html)) continue;
-    matched.push(sig.id);
-    if (sig.verdict === 'in') bestIn = Math.max(bestIn, sig.weight);
-    else bestOut = Math.max(bestOut, sig.weight);
-  }
-
-  if (bestIn === 0 && bestOut === 0) {
-    return { status: 'unknown', matched, reason: '재고 신호를 하나도 못 찾음 (마크업이 바뀌었거나 차단 페이지)' };
-  }
-  // 양쪽이 비슷한 세기로 잡히면 어느 쪽도 믿지 않는다. 쿠팡은 품절 상품에도
-  // og 메타가 instock 인 채로 남아 있는 경우가 있어서, 근소한 우세로
-  // "재입고!" 를 쏘면 헛걸음을 시킨다.
-  if (Math.abs(bestIn - bestOut) < AMBIGUITY_MARGIN) {
-    return { status: 'unknown', matched, reason: `판매중(${bestIn})/품절(${bestOut}) 신호가 맞붙음` };
-  }
-  return bestIn > bestOut
-    ? { status: 'in', matched, reason: '판매중 신호 우세' }
-    : { status: 'out', matched, reason: '품절 신호 우세' };
 }
 
 function parsePrice(html) {
@@ -286,6 +372,8 @@ const DISCORD_COLORS = {
   price_drop: 0x3498db, // 파랑 - 값이 내려감
   soldout:    0x95a5a6, // 회색 - 빠졌음
   gone:       0xe74c3c, // 빨강 - 페이지가 없어짐
+  stuck:      0xf39c12, // 주황 - 감시기 자체가 문제
+  recovered:  0x1abc9c, // 청록 - 다시 정상
   test:       0x9b59b6,
 };
 
@@ -401,8 +489,8 @@ const CHANNELS = {
 };
 
 async function notify(cfg, msg) {
-  console.log(`  >> ${msg.text}`);
-  console.log(`     ${msg.url}`);
+  log(`  >> ${msg.text}`);
+  log(`     ${msg.url}`);
 
   const entries = Object.entries(cfg.notify || {}).filter(([, c]) => c && c.enabled);
   if (entries.length === 0) {
@@ -417,7 +505,7 @@ async function notify(cfg, msg) {
     }
     try {
       await send(conf, msg);
-      console.log(`     [${name}] 전송 완료`);
+      log(`     [${name}] 전송 완료`);
     } catch (err) {
       console.error(`     [${name}] 전송 실패: ${err.message}`);
     }
@@ -453,6 +541,10 @@ function loadConfig(file) {
     userAgent: raw.userAgent || DEFAULT_UA,
     notify: raw.notify || {},
     targets: raw.targets || [],
+    // 몇 번 연속 판정에 실패하면 "감시가 안 돌고 있다" 고 알릴지. 0 이면 끔
+    alertStuckAfter: raw.alertStuckAfter ?? 3,
+    stuckCooldownMinutes: raw.stuckCooldownMinutes ?? 360,
+    logFile: raw.logFile || null,
     useBrowser: false,
   };
   if (cfg.targets.length === 0) throw new Error(`${file} 에 targets 가 비어 있습니다`);
@@ -532,26 +624,59 @@ async function runOnce(cfg, statePath) {
     const now = await probe(target, cfg);
 
     const priceText = now.price != null ? ` ${now.price.toLocaleString('ko-KR')}원` : '';
-    console.log(`[${stamp}] ${target.name}: ${STATUS_LABEL[now.status] || now.status}${priceText}`);
-    if (now.status !== 'in' && now.status !== 'out') console.log(`  - ${now.reason}`);
+    log(`[${stamp}] ${target.name}: ${STATUS_LABEL[now.status] || now.status}${priceText}`);
 
     // 판정 못 한 회차는 상태를 덮어쓰지 않는다. 차단/오류를 "품절"로 기록하면
     // 다음에 정상 응답이 왔을 때 가짜 재입고 알림이 나간다.
     if (now.status === 'unknown' || now.status === 'blocked' || now.status === 'error') {
       const misses = (prev && prev.consecutiveMisses ? prev.consecutiveMisses : 0) + 1;
-      state.targets[target.id] = { ...(prev || {}), consecutiveMisses: misses, lastCheckedAt: stamp, lastMissReason: now.reason };
-      if (misses === 5 || misses % 20 === 0) {
-        console.warn(`  ! ${misses}회 연속 판정 실패. 'node watch.js dump <url>' 로 HTML을 받아 SIGNALS 를 손보세요.`);
+      const notifiedAt = { ...((prev && prev.notifiedAt) || {}) };
+      log(`  - ${now.reason} (${misses}회 연속)`);
+
+      /* 감시기가 조용히 죽어 있는 게 제일 나쁘다. 재고가 떠도 알림이 안 오는데
+         사용자는 "아직 품절인가 보다" 하고 넘어간다. 판정을 못 하는 상태가
+         이어지면 그 사실 자체를 알린다. */
+      if (cfg.alertStuckAfter > 0 && misses >= cfg.alertStuckAfter
+          && !withinCooldown(prev, 'stuck', cfg.stuckCooldownMinutes)) {
+        await notify(cfg, {
+          event: 'stuck',
+          label: '감시 작동 안 함',
+          name: target.name,
+          price: null,
+          url: target.shortUrl || target.url,
+          text: `[감시 작동 안 함] ${target.name} — ${misses}회 연속 재고 판정 실패: ${now.reason}`,
+        });
+        notifiedAt.stuck = stamp;
+        log("  ! 'node watch.js diagnose' 로 원인을 확인하세요.");
       }
+
+      state.targets[target.id] = {
+        ...(prev || {}), consecutiveMisses: misses, lastCheckedAt: stamp,
+        lastMissReason: now.reason, notifiedAt,
+      };
       continue;
+    }
+
+    // 막혔다가 되살아났으면 그것도 알려준다. 언제부터 다시 도는지 알아야 한다.
+    if (prev && prev.consecutiveMisses >= cfg.alertStuckAfter && cfg.alertStuckAfter > 0
+        && prev.notifiedAt && prev.notifiedAt.stuck) {
+      await notify(cfg, {
+        event: 'recovered',
+        label: '감시 정상화',
+        name: target.name,
+        price: now.price,
+        url: target.shortUrl || now.url,
+        text: `[감시 정상화] ${target.name} — 다시 정상 판정 중 (${STATUS_LABEL[now.status]})`,
+      });
     }
 
     const events = decideEvents(target, prev, now);
     const notifiedAt = { ...((prev && prev.notifiedAt) || {}) };
+    delete notifiedAt.stuck; // 정상으로 돌아왔으니 다음 장애는 즉시 알린다
 
     for (const ev of events) {
       if (withinCooldown(prev, ev.kind, target.cooldownMinutes)) {
-        console.log(`  - ${ev.label} 이지만 쿨다운(${target.cooldownMinutes}분) 중이라 건너뜀`);
+        log(`  - ${ev.label} 이지만 쿨다운(${target.cooldownMinutes}분) 중이라 건너뜀`);
         continue;
       }
       await notify(cfg, {
@@ -637,6 +762,95 @@ async function cmdDump(url, outPath, cfg) {
   console.log(`제목: ${parseTitle(r.body || '') ?? '못 찾음'}`);
 }
 
+/* "재고 떴는데 알림이 안 왔다" 를 한 번에 추적한다.
+   설정 -> 요청 -> 판정 -> 상태 -> 알림 판단까지 각 단계를 전부 보여준다. */
+async function cmdDiagnose(cfg, statePath) {
+  const line = (t = '') => console.log(t);
+  line('=== 1. 설정 ===');
+  line(`검사 주기      : ${cfg.intervalSeconds}초 (±${cfg.jitterSeconds}초)`);
+  line(`감시 대상      : ${cfg.targets.length}개`);
+  line(`판정실패 알림   : ${cfg.alertStuckAfter > 0 ? `${cfg.alertStuckAfter}회 연속부터` : '꺼짐'}`);
+  line(`로그 파일      : ${cfg.logFile || '(없음)'}`);
+
+  const channels = Object.entries(cfg.notify || {}).filter(([, c]) => c && c.enabled);
+  if (channels.length === 0) {
+    line('알림 채널      : !! 하나도 켜져 있지 않습니다. 이것만으로도 알림이 안 옵니다');
+  } else {
+    for (const [name, conf] of channels) {
+      // 값 자체는 찍지 않는다. 채워졌는지만 본다.
+      const keys = ['webhookUrl', 'url', 'accessToken', 'refreshToken', 'command'];
+      const missing = keys.filter((k) => k in conf && !secret(conf[k]));
+      line(`알림 채널      : ${name} ${missing.length ? `!! 비어 있음 -> ${missing.join(', ')}` : 'OK'}`);
+    }
+  }
+
+  line();
+  line('=== 2. 상품별 점검 (실제로 알림을 보내지는 않습니다) ===');
+  const state = readJson(statePath, { targets: {} });
+
+  for (const target of cfg.targets) {
+    line(`\n[${target.name}]`);
+    line(`  URL   : ${target.url || target.shortUrl}`);
+
+    const url = target.url || target.shortUrl;
+    const opts = { timeoutMs: cfg.timeoutMs, userAgent: cfg.userAgent, retries: 0 };
+    let r = cfg.useBrowser ? await fetchHtmlViaBrowser(url, opts) : null;
+    if (!r) r = await fetchHtml(url, opts);
+
+    line(`  응답  : HTTP ${r.httpStatus}, ${(r.body || '').length.toLocaleString('ko-KR')} bytes`);
+    if (r.httpStatus === 403 || r.httpStatus === 429) {
+      line('  !! 쿠팡이 요청을 거절했습니다. 원인 1순위입니다.');
+      line('     주기를 늘리거나 --browser 로 실행해 보세요.');
+    }
+    if (r.body && r.body.length < 20000) {
+      line('  !! 본문이 너무 짧습니다. 상품 페이지가 아니라 차단/캡차 페이지일 수 있습니다.');
+    }
+
+    if (r.body) {
+      const v = judgeStock(r.body);
+      line(`  판정  : ${STATUS_LABEL[v.status]} (근거: ${v.reason})`);
+      line(`  경로  : ${v.tier} / 검사범위 ${v.scope}`);
+      line(`  신호  : ${v.matched.join(', ') || '없음'}`);
+      line(`  가격  : ${parsePrice(r.body) ?? '못 찾음'}`);
+      line(`  제목  : ${parseTitle(r.body) ?? '못 찾음'}`);
+
+      if (v.status === 'unknown') {
+        line('  !! 재고를 판정하지 못했습니다. 이 상태에서는 알림이 나가지 않습니다.');
+        line("     'node watch.js dump <url> -o dump.html' 로 받아서 마크업을 확인하세요.");
+      }
+
+      const prev = state.targets[target.id] || null;
+      line(`  기록  : ${prev ? `${STATUS_LABEL[prev.status] || prev.status} (${prev.lastCheckedAt})` : '없음 (한 번도 검사한 적 없음)'}`);
+      if (prev && prev.consecutiveMisses) line(`          연속 판정실패 ${prev.consecutiveMisses}회 — ${prev.lastMissReason || ''}`);
+      if (prev && prev.notifiedAt) {
+        for (const [k, t] of Object.entries(prev.notifiedAt)) line(`          마지막 ${k} 알림: ${t}`);
+      }
+
+      if (v.status === 'in' || v.status === 'out') {
+        const evs = decideEvents(target, prev, { ...v, price: parsePrice(r.body) });
+        if (evs.length === 0) {
+          line('  알림  : 보낼 알림 없음 (상태가 그대로거나 notifyOn 에 없음)');
+        } else {
+          for (const ev of evs) {
+            const cooling = withinCooldown(prev, ev.kind, target.cooldownMinutes);
+            line(`  알림  : ${ev.label}${cooling ? ` — 그러나 쿨다운 ${target.cooldownMinutes}분에 걸려 안 나감` : ' — 지금 check 하면 발송됨'}`);
+          }
+        }
+      }
+    }
+
+    line(`  설정  : notifyOn=[${target.notifyOn.join(', ')}] cooldown=${target.cooldownMinutes}분`);
+  }
+
+  line();
+  line('=== 3. 알림이 안 왔다면 흔한 원인 ===');
+  line(` a) 감시기가 안 돌고 있었다        -> ps 로 확인, cron 이면 로그 확인`);
+  line(` b) 주기가 길어 재고 창을 놓쳤다   -> ${cfg.intervalSeconds}초. 금방 빠지는 품목이면 60~120초로`);
+  line(' c) 쿠팡이 막았다 (위 HTTP 403)    -> --browser, 주기 늘리기, 가정용 회선');
+  line(' d) 재고 판정 실패 (위 판정불가)   -> dump 로 마크업 확인');
+  line(' e) 알림 채널 설정 누락            -> 위 1번의 !! 표시');
+}
+
 async function cmdNotifyTest(cfg) {
   const t = cfg.targets[0];
   await notify(cfg, {
@@ -668,12 +882,14 @@ function usage() {
   node watch.js watch                 주기적으로 계속 검사
   node watch.js resolve <단축링크>     link.coupang.com 링크에서 상품 URL 추출
   node watch.js dump <url> [-o 파일]   받아온 HTML 저장 + 판정 결과 출력
+  node watch.js diagnose              알림이 안 오는 원인을 단계별로 추적
   node watch.js notify-test           알림 채널만 시험 발송
   node watch.js selftest              파서 회귀 테스트
 
 옵션
   --config <경로>   설정 파일 (기본: ./targets.json)
   --state  <경로>   상태 파일 (기본: ./state.json)
+  --log    <경로>   검사 기록을 파일로 남기기
   --browser         playwright 로 실제 브라우저를 띄워서 가져오기
 `);
 }
@@ -683,7 +899,7 @@ async function main(argv) {
   const cmd = args[0] || 'help';
 
   // --config/--state/-o 는 값을 하나 먹고, 나머지 비플래그 인자는 위치 인자다
-  const VALUE_FLAGS = new Set(['--config', '--state', '-o']);
+  const VALUE_FLAGS = new Set(['--config', '--state', '-o', '--log']);
   const opts = {};
   const positional = [];
   for (let i = 1; i < args.length; i++) {
@@ -700,7 +916,7 @@ async function main(argv) {
   if (cmd === 'help' || cmd === '--help' || cmd === '-h') return usage();
 
   // resolve / dump 는 설정 파일 없이도 돌아야 한다
-  const needsConfig = cmd === 'check' || cmd === 'watch' || cmd === 'notify-test';
+  const needsConfig = ['check', 'watch', 'notify-test', 'diagnose'].includes(cmd);
   let cfg;
   if (needsConfig) {
     cfg = loadConfig(configPath);
@@ -708,12 +924,14 @@ async function main(argv) {
     cfg = { timeoutMs: 15000, retries: 2, userAgent: DEFAULT_UA, notify: {}, targets: [] };
   }
   cfg.useBrowser = useBrowser;
+  setLogFile(opts['--log'] || cfg.logFile);
 
   switch (cmd) {
     case 'check': return runOnce(cfg, statePath);
     case 'watch': return runForever(cfg, statePath);
     case 'resolve': return cmdResolve(positional[0], cfg);
     case 'dump': return cmdDump(positional[0], opts['-o'] || null, cfg);
+    case 'diagnose': return cmdDiagnose(cfg, statePath);
     case 'notify-test': return cmdNotifyTest(cfg);
     default:
       usage();

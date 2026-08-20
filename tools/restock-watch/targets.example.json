@@ -4,6 +4,10 @@
   "timeoutMs": 15000,
   "retries": 2,
 
+  "alertStuckAfter": 3,
+  "stuckCooldownMinutes": 360,
+  "logFile": "watch.log",
+
   "notify": {
     "kakao":   { "enabled": false, "accessToken": "env:KAKAO_ACCESS_TOKEN" },
     "slack":   { "enabled": false, "webhookUrl": "env:SLACK_WEBHOOK_URL" },
